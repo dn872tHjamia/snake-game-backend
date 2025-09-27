@@ -5,9 +5,11 @@ const { nanoid } = require('nanoid');
 
 const app = express();
 const server = http.createServer(app);
+
+// Configuración de CORS más explícita
 const io = new Server(server, {
   cors: {
-    origin: "*", // En producción, deberías cambiar esto a la URL de tu Netlify
+    origin: "*", // Permite conexiones desde cualquier origen
     methods: ["GET", "POST"]
   }
 });
@@ -16,121 +18,122 @@ const rooms = {};
 const gridSize = 20;
 
 io.on('connection', (socket) => {
-  console.log('Un usuario se ha conectado:', socket.id);
+  console.log(`[CONEXIÓN] Usuario conectado: ${socket.id}`);
 
-  // El host crea una nueva sala
-  socket.on('createRoom', () => {
-    const roomId = nanoid(5); // Genera un código de 5 caracteres
+  socket.on('createRoom', (data) => {
+    if (!data || typeof data.playerName === 'undefined') {
+      console.log(`[ERROR] Intento de crear sala con datos inválidos desde ${socket.id}`);
+      return;
+    }
+    
+    const playerName = data.playerName;
+    // CORRECCIÓN CLAVE: El código de la sala se genera en mayúsculas.
+    const roomId = nanoid(5).toUpperCase(); 
+    
     rooms[roomId] = {
       players: {},
       apple: generateApple(),
-      gameState: 'waiting', // Estados: waiting, playing
+      gameState: 'waiting',
       host: socket.id
     };
+    
+    rooms[roomId].players[socket.id] = createPlayer(socket.id, playerName);
     socket.join(roomId);
-    rooms[roomId].players[socket.id] = createPlayer(socket.id);
+    
+    console.log(`[SALA CREADA] Jugador "${playerName}" (${socket.id}) ha creado la sala: ${roomId}`);
+    
     socket.emit('roomCreated', { roomId, players: rooms[roomId].players, hostId: rooms[roomId].host });
   });
 
-  // Un jugador se une a una sala existente
-  socket.on('joinRoom', (roomId) => {
-    if (rooms[roomId]) {
-      if (rooms[roomId].gameState === 'playing') {
+  socket.on('joinRoom', (data) => {
+    if (!data || !data.playerName || !data.roomId) {
+      console.log(`[ERROR] Intento de unirse a sala con datos incompletos desde ${socket.id}`);
+      return;
+    }
+
+    // El cliente ya envía el roomId en mayúsculas, así que la comparación funcionará.
+    const { roomId, playerName } = data; 
+    const room = rooms[roomId];
+
+    if (room) {
+      if (room.gameState === 'playing') {
         socket.emit('error', 'La partida ya ha comenzado.');
         return;
       }
       socket.join(roomId);
-      rooms[roomId].players[socket.id] = createPlayer(socket.id);
-      io.to(roomId).emit('updatePlayers', { players: rooms[roomId].players, hostId: rooms[roomId].host });
+      room.players[socket.id] = createPlayer(socket.id, playerName);
+      console.log(`[UNIÓN A SALA] Jugador "${playerName}" (${socket.id}) se unió a la sala: ${roomId}`);
+      io.to(roomId).emit('updatePlayers', { players: room.players, hostId: room.host });
     } else {
+      console.log(`[ERROR DE UNIÓN] Jugador "${playerName}" intentó unirse a sala inexistente: ${roomId}`);
       socket.emit('error', 'La sala no existe.');
     }
   });
   
-  // El host inicia la partida
   socket.on('startGame', (roomId) => {
-      if (rooms[roomId] && rooms[roomId].host === socket.id) {
-          rooms[roomId].gameState = 'playing';
-          io.to(roomId).emit('gameStarted', rooms[roomId]);
-          startGameInterval(roomId);
-      }
+    const room = rooms[roomId];
+    if (room && room.host === socket.id) {
+        console.log(`[PARTIDA INICIADA] La partida en la sala ${roomId} ha comenzado.`);
+        room.gameState = 'playing';
+        io.to(roomId).emit('gameStarted', room);
+        startGameInterval(roomId);
+    }
   });
 
-  // Un jugador actualiza su dirección
   socket.on('directionChange', (data) => {
     const { roomId, direction } = data;
-    if (rooms[roomId] && rooms[roomId].players[socket.id]) {
-        const player = rooms[roomId].players[socket.id];
+    const room = rooms[roomId];
+    if (room && room.players[socket.id]) {
+        const player = room.players[socket.id];
         const { dx, dy } = player;
-
         if (direction === 'up' && dy === 0) { player.dx = 0; player.dy = -gridSize; }
-        if (direction === 'down' && dy === 0) { player.dx = 0; player.dy = gridSize; }
-        if (direction === 'left' && dx === 0) { player.dx = -gridSize; player.dy = 0; }
-        if (direction === 'right' && dx === 0) { player.dx = gridSize; player.dy = 0; }
+        else if (direction === 'down' && dy === 0) { player.dx = 0; player.dy = gridSize; }
+        else if (direction === 'left' && dx === 0) { player.dx = -gridSize; player.dy = 0; }
+        else if (direction === 'right' && dx === 0) { player.dx = gridSize; player.dy = 0; }
     }
   });
 
   socket.on('disconnect', () => {
-    console.log('Un usuario se ha desconectado:', socket.id);
+    console.log(`[DESCONEXIÓN] Usuario desconectado: ${socket.id}`);
     for (const roomId in rooms) {
       if (rooms[roomId].players[socket.id]) {
+        const playerName = rooms[roomId].players[socket.id].name;
+        console.log(`[JUGADOR ELIMINADO] Jugador "${playerName}" eliminado de la sala ${roomId}`);
         delete rooms[roomId].players[socket.id];
-        // Si el host se desconecta, se podría eliminar la sala
+        
         if (rooms[roomId].host === socket.id) {
+            console.log(`[HOST DESCONECTADO] El host ha salido. Cerrando sala ${roomId}.`);
             io.to(roomId).emit('error', 'El host se ha desconectado. Fin de la partida.');
             delete rooms[roomId];
         } else {
             io.to(roomId).emit('updatePlayers', { players: rooms[roomId].players, hostId: rooms[roomId].host });
         }
-        break;
+        return; 
       }
     }
   });
 });
 
-function createPlayer(id) {
-    return {
-        id: id,
-        body: [{ x: Math.floor(Math.random() * 30) * gridSize, y: Math.floor(Math.random() * 30) * gridSize }],
-        dx: gridSize,
-        dy: 0,
-        score: 0,
-        color: `hsl(${Math.random() * 360}, 90%, 70%)`
-    };
+function createPlayer(id, name) {
+    const safeName = (name || 'Anónimo').trim().slice(0, 12);
+    return { id, name: safeName, body: [{ x: Math.floor(Math.random() * 30) * gridSize, y: Math.floor(Math.random() * 30) * gridSize }], dx: 0, dy: 0, score: 0, color: `hsl(${Math.random() * 360}, 90%, 70%)`};
 }
 
 function generateApple() {
-    return {
-        x: Math.floor(Math.random() * 30) * gridSize,
-        y: Math.floor(Math.random() * 30) * gridSize,
-    };
-}
-
-function startGameInterval(roomId) {
-    const intervalId = setInterval(() => {
-        const room = rooms[roomId];
-        if (!room) {
-            clearInterval(intervalId);
-            return;
-        }
-
-        updateGameState(roomId);
-        io.to(roomId).emit('gameStateUpdate', { players: room.players, apple: room.apple });
-
-    }, 120);
+    return { x: Math.floor(Math.random() * 30) * gridSize, y: Math.floor(Math.random() * 30) * gridSize };
 }
 
 function updateGameState(roomId) {
     const room = rooms[roomId];
     if (!room) return;
     const playersToDelete = [];
-
     for (const id in room.players) {
         const player = room.players[id];
+        if (player.dx === 0 && player.dy === 0) continue; 
+        
         const head = { x: player.body[0].x + player.dx, y: player.body[0].y + player.dy };
         player.body.unshift(head);
-
-        // Hitbox de la manzana agrandada (se considera una colisión si la cabeza está a menos de gridSize de distancia)
+        
         const dist = Math.sqrt(Math.pow(head.x - room.apple.x, 2) + Math.pow(head.y - room.apple.y, 2));
         if (dist < gridSize) {
             player.score++;
@@ -138,36 +141,52 @@ function updateGameState(roomId) {
         } else {
             player.body.pop();
         }
-
+        
         if (checkCollision(head, id, room.players)) {
             playersToDelete.push(id);
         }
     }
-    
     playersToDelete.forEach(id => {
-        delete room.players[id];
-        io.to(roomId).emit('playerEliminated', { playerId: id, remainingPlayers: room.players });
+        if(room.players[id]) { 
+            console.log(`[JUGADOR ELIMINADO] Jugador "${room.players[id].name}" ha chocado.`);
+            delete room.players[id];
+            io.to(roomId).emit('playerEliminated', { playerId: id, remainingPlayers: room.players });
+        }
     });
 }
 
 function checkCollision(head, playerId, players) {
-    // Colisión con bordes
-    if (head.x < 0 || head.x >= 600 || head.y < 0 || head.y >= 600) {
-        return true;
-    }
-    // Colisión con otros jugadores
+    if (head.x < 0 || head.x >= 600 || head.y < 0 || head.y >= 600) return true;
+    
     for (const id in players) {
         for (let i = 0; i < players[id].body.length; i++) {
             if (id === playerId && i === 0) continue;
-            if (head.x === players[id].body[i].x && head.y === players[id].body[i].y) {
-                return true;
-            }
+            if (head.x === players[id].body[i].x && head.y === players[id].body[i].y) return true;
         }
     }
     return false;
 }
 
+function startGameInterval(roomId) {
+    const room = rooms[roomId];
+    if (!room) return;
+    
+    if(room.players[room.host]) {
+        room.players[room.host].dx = gridSize;
+    }
+
+    const intervalId = setInterval(() => {
+        const currentRoom = rooms[roomId];
+        if (!currentRoom || Object.keys(currentRoom.players).length === 0) {
+            console.log(`[FIN DE PARTIDA] Sala ${roomId} vacía o cerrada. Deteniendo bucle de juego.`);
+            clearInterval(intervalId);
+            if (!currentRoom) delete rooms[roomId];
+            return;
+        }
+        updateGameState(roomId);
+        io.to(roomId).emit('gameStateUpdate', currentRoom);
+    }, 120);
+}
+
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Servidor escuchando en el puerto ${PORT}`);
-});
+server.listen(PORT, () => console.log(`[SERVIDOR] Escuchando en el puerto ${PORT}`));
